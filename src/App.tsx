@@ -1,40 +1,93 @@
 // src/App.tsx
 import React, { useEffect, useMemo, useRef, useState } from "react";
 
+/* ===================== Safe formatters ===================== */
+const isFiniteNum = (x: any): x is number =>
+  typeof x === "number" && Number.isFinite(x);
+
+const coerceNum = (x: any): number => {
+  if (isFiniteNum(x)) return x;
+  const n = Number(x);
+  return Number.isFinite(n) ? n : NaN;
+};
+
+/** Format number with d decimals; returns "—" if not numeric */
+export const fmt = (x: any, d = 2): string => {
+  const n = coerceNum(x);
+  return Number.isFinite(n) ? n.toFixed(d) : "—";
+};
+
+/** Like fmt() but returns "—" for 0 as well (useful for missing NBBO/IV) */
+const fmtOrDashIfZero = (x: any, d = 2): string => {
+  const n = coerceNum(x);
+  if (!Number.isFinite(n) || n === 0) return "—";
+  return n.toFixed(d);
+};
+
+/** Format IV as percent; accepts 0–1 or 0–100 styles; dash for <= 0 */
+export const fmtIvPct = (iv: any): string => {
+  const n = Number(iv);
+  if (!Number.isFinite(n) || n <= 0) return "—";
+  const pctRaw = n > 1.5 ? n : n * 100;
+  const pct = Math.min(pctRaw, 300); // safety cap
+  return `${Math.round(pct)}%`;
+};
+
+/** “x time ago” for timestamps; returns "—" if invalid */
+export const tsAgo = (ts: any): string => {
+  const t = coerceNum(ts);
+  if (!Number.isFinite(t)) return "—";
+  const diff = Date.now() - t;
+  if (diff < 1500) return "now";
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  return `${d}d`;
+};
+
 /* ===================== Types ===================== */
 type EquityTick = {
   symbol: string;
-  last?: number;
-  bid?: number;
-  ask?: number;
-  iv?: number;
+  last?: number | null;
+  bid?: number | null;
+  ask?: number | null;
+  iv?: number | null;
   ts?: number;
 };
+
+type EquityPayload = EquityTick[] | { rows?: EquityTick[]; es_spx_basis?: number | null };
+
 type OptionRow = {
   underlying: string;
   expiration: string;
   strike: number;
   right: "C" | "P";
   last?: number | null;
-  bid?: number;
-  ask?: number;
+  bid?: number | null;
+  ask?: number | null;
   ts?: number;
 };
+
 type FlowBase = {
   ul: string;
   right: "CALL" | "PUT";
   strike: number;
   expiry: string;
-  side: "BUY" | "SELL";
+  side: "BUY" | "SELL" | "UNKNOWN";
   qty: number;
   price: number;
-  notional?: number;   // optional from server
+  notional?: number;
   prints?: number;
   venue?: string;
   ts: number;
 };
 type Sweep = FlowBase & { kind: "SWEEP" };
 type Block = FlowBase & { kind: "BLOCK" };
+
 type Watchlist = {
   equities: string[];
   options: { underlying: string; expiration: string; strike: number; right: "C" | "P" }[];
@@ -45,29 +98,55 @@ const API_BASE = import.meta.env.VITE_API_BASE ?? "http://127.0.0.1:8080";
 const WS_URL = import.meta.env.VITE_WS_URL ?? "ws://127.0.0.1:8080/ws";
 
 /* ===================== Helpers ===================== */
-function fmt(n?: number | null, d = 2) {
-  if (n === undefined || n === null || Number.isNaN(n)) return "–";
-  return n.toFixed(d);
-}
-function tsAgo(ts?: number) {
-  if (!ts) return "–";
-  const s = Math.max(0, Math.floor((Date.now() - ts) / 1000));
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m`;
-  const h = Math.floor(m / 60);
-  return `${h}h`;
-}
 const notionalOf = (m: { notional?: number; qty?: number; price?: number }) =>
   Math.round(m.notional ?? ((m.qty || 0) * (m.price || 0) * 100));
+
+/** Accept only legit ticker-y strings, drop commas/garbage, dedupe */
+const TICKER_OK = /^[A-Z0-9][A-Z0-9.\-_/]{0,9}$/; // 1–10 chars, starts alnum
+const uniq = <T,>(arr: T[]) => Array.from(new Set(arr));
+
+const parseSymbolsList = (v: unknown): string[] => {
+  const arr = Array.isArray(v) ? v.map(String) : typeof v === "string" ? v.split(/[\s,;|]+/) : [];
+  return uniq(
+    arr
+      .map((s) => s.trim().toUpperCase())
+      .filter((s) => TICKER_OK.test(s))
+  );
+};
+
+const normalizeWatchlist = (raw: any): Watchlist => ({
+  equities: parseSymbolsList(raw?.equities),
+  options: Array.isArray(raw?.options) ? raw.options : [],
+});
+
+/** Normalize symbols to a consistent key: '/ES' -> 'ES' */
+const normalizeSymbol = (s: string) => s?.toUpperCase().replace(/^\//, "") ?? s;
+
+/** marketFmt: symbol-aware formatting for prices (SPX/ES get more precision, very large prices get 1–2 dp) */
+const marketFmt = {
+  price(sym: string, x: any): string {
+    const n = coerceNum(x);
+    if (!Number.isFinite(n)) return "—";
+    const s = normalizeSymbol(sym);
+    // Slightly higher precision for index/futures
+    const special = s === "SPX" || s === "ES";
+    const d =
+      special ? 2 : n >= 1000 ? 1 : 2; // tweak as you like
+    return n.toFixed(d);
+  },
+  nbbo(x: any): string {
+    return fmtOrDashIfZero(x, 2);
+  },
+  iv(iv: any): string {
+    return fmtIvPct(iv);
+  },
+};
 
 /* ===================== App ===================== */
 export default function App() {
   const wsRef = useRef<WebSocket | null>(null);
 
-  // --- Local filters ---
-//   const [minNotional, setMinNotional] = useState<number>(20000);
-//   const [minQty, setMinQty] = useState<number>(50);
+  // Filters (start permissive so demo data shows)
   const [minNotional, setMinNotional] = useState<number>(0);
   const [minQty, setMinQty] = useState<number>(1);
 
@@ -78,11 +157,13 @@ export default function App() {
   const [blocks, setBlocks] = useState<Block[]>([]);
   const [wl, setWl] = useState<Watchlist>({ equities: [], options: [] });
   const [err, setErr] = useState<string | undefined>();
+  const [basis, setBasis] = useState<number | null>(null); // ES–SPX basis if server sends it
 
   // --- WS connect ---
   useEffect(() => {
     let stopped = false;
     let retry = 0;
+
     const connect = () => {
       if (stopped) return;
       setWsState("connecting");
@@ -101,37 +182,64 @@ export default function App() {
         }
       };
       ws.onerror = () => setWsState("error");
+
       ws.onmessage = (ev) => {
         try {
           const msg = JSON.parse(ev.data);
+
           switch (msg.topic) {
             case "equity_ts": {
-              const arr = msg.data as EquityTick[];
+              const payload = msg.data as EquityPayload;
+
+              const arr: EquityTick[] = Array.isArray(payload)
+                ? payload
+                : Array.isArray(payload?.rows)
+                ? payload.rows!
+                : [];
+
+              // optional basis
+              const maybeBasis = Array.isArray(payload) ? null : (payload as any)?.es_spx_basis ?? null;
+              setBasis(
+                typeof maybeBasis === "number" && Number.isFinite(maybeBasis) ? maybeBasis : null
+              );
+
+              if (!arr.length) break;
+
               setEquity((prev) => {
                 const next = { ...prev };
-                arr.forEach((t) => {
-                  next[t.symbol] = t;
-                });
+                for (const t of arr) {
+                  const sym = normalizeSymbol(t.symbol);
+                  next[sym] = { ...t, symbol: sym };
+                }
                 return next;
               });
               break;
+            }
+            case "basis": {
+            const { es_spx_basis } = msg.data || {};
+            setBasis(es_spx_basis ?? null);
+            break;
             }
             case "options_ts": {
               setOptions(msg.data as OptionRow[]);
               break;
             }
+
             case "sweeps": {
               setSweeps((prev) => [...prev.slice(-400), ...(msg.data as Sweep[])]);
               break;
             }
+
             case "blocks": {
               setBlocks((prev) => [...prev.slice(-400), ...(msg.data as Block[])]);
               break;
             }
+
             case "watchlist": {
-              setWl(msg.data as Watchlist);
+              setWl(normalizeWatchlist(msg.data));
               break;
             }
+
             default:
               break;
           }
@@ -140,12 +248,13 @@ export default function App() {
         }
       };
     };
+
     connect();
     return () => {
       stopped = true;
       wsRef.current?.close();
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   // --- Derived views ---
   const equityRows = useMemo(
@@ -180,10 +289,12 @@ export default function App() {
   // --- REST actions (watchlist) ---
   async function addEquity(sym: string) {
     try {
+      const cleaned = parseSymbolsList(sym).at(0);
+      if (!cleaned) return;
       const res = await fetch(`${API_BASE}/watchlist/equities`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: sym.trim().toUpperCase() }),
+        body: JSON.stringify({ symbol: cleaned }),
       });
       if (!res.ok) throw new Error(`POST /watchlist/equities ${res.status}`);
     } catch (e: any) {
@@ -223,6 +334,11 @@ export default function App() {
             {wsState}
           </span>
         </div>
+        {typeof basis === "number" && (
+          <div className="text-sm px-2 py-1 rounded bg-blue-50 text-blue-800">
+            ES–SPX basis: {fmt(basis, 2)}
+          </div>
+        )}
         {err && <div className="text-sm text-red-600 ml-2">Error: {err}</div>}
         <div className="ml-auto text-xs text-gray-500">
           API_BASE: {API_BASE} · WS_URL: {WS_URL}
@@ -252,10 +368,10 @@ export default function App() {
                   {equityRows.map((r) => (
                     <tr key={r.symbol} className="border-b last:border-0">
                       <td className="py-1 pr-3 font-mono">{r.symbol}</td>
-                      <td className="py-1 pr-3">{fmt(r.last, 2)}</td>
-                      <td className="py-1 pr-3">{fmt(r.bid, 2)}</td>
-                      <td className="py-1 pr-3">{fmt(r.ask, 2)}</td>
-                      <td className="py-1 pr-3">{fmt(r.iv, 0)}</td>
+                      <td className="py-1 pr-3">{marketFmt.price(r.symbol, r.last)}</td>
+                      <td className="py-1 pr-3">{marketFmt.nbbo(r.bid)}</td>
+                      <td className="py-1 pr-3">{marketFmt.nbbo(r.ask)}</td>
+                      <td className="py-1 pr-3">{marketFmt.iv(r.iv)}</td>
                       <td className="py-1 pr-3">{tsAgo(r.ts)}</td>
                     </tr>
                   ))}
@@ -292,8 +408,8 @@ export default function App() {
                               <td className="py-1 pr-3">{r.strike}</td>
                               <td className="py-1 pr-3">{r.right}</td>
                               <td className="py-1 pr-3">{fmt(r.last, 2)}</td>
-                              <td className="py-1 pr-3">{fmt(r.bid, 2)}</td>
-                              <td className="py-1 pr-3">{fmt(r.ask, 2)}</td>
+                              <td className="py-1 pr-3">{fmtOrDashIfZero(r.bid, 2)}</td>
+                              <td className="py-1 pr-3">{fmtOrDashIfZero(r.ask, 2)}</td>
                               <td className="py-1 pr-3">{tsAgo(r.ts)}</td>
                             </tr>
                           ))}
@@ -316,7 +432,7 @@ export default function App() {
               <input
                 value={newSym}
                 onChange={(e) => setNewSym(e.target.value)}
-                placeholder="Add symbol (e.g., NVDA)"
+                placeholder="Add symbol (e.g., NVDA or /ES)"
                 className="border rounded px-2 py-1 text-sm"
               />
               <button
