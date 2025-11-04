@@ -85,12 +85,23 @@ type FlowBase = {
   venue?: string;
   ts: number;
 };
-type Sweep = FlowBase & { kind: "SWEEP" };
-type Block = FlowBase & { kind: "BLOCK" };
+type Sweep = FlowBase & { kind?: "SWEEP" };
+type Block = FlowBase & { kind?: "BLOCK" };
 
 type Watchlist = {
   equities: string[];
   options: { underlying: string; expiration: string; strike: number; right: "C" | "P" }[];
+};
+
+type Headline = {
+  type: "SWEEP" | "BLOCK" | "PRINT";
+  ul: string;
+  right?: "C" | "P" | "CALL" | "PUT";
+  strike?: number;
+  expiry?: string;
+  side?: "BUY" | "SELL" | "UNKNOWN";
+  notional: number;
+  ts: number;
 };
 
 /* ===================== Config ===================== */
@@ -128,10 +139,8 @@ const marketFmt = {
     const n = coerceNum(x);
     if (!Number.isFinite(n)) return "—";
     const s = normalizeSymbol(sym);
-    // Slightly higher precision for index/futures
     const special = s === "SPX" || s === "ES";
-    const d =
-      special ? 2 : n >= 1000 ? 1 : 2; // tweak as you like
+    const d = special ? 2 : n >= 1000 ? 1 : 2;
     return n.toFixed(d);
   },
   nbbo(x: any): string {
@@ -141,6 +150,75 @@ const marketFmt = {
     return fmtIvPct(iv);
   },
 };
+
+const nf0 = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
+const nf2 = new Intl.NumberFormat("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtQty = (x: number) => nf0.format(Math.max(0, Math.round(x || 0)));
+const fmtMoneyCompact = (n: number) => {
+  const x = Math.max(0, Math.round(n || 0));
+  if (x >= 1_000_000) return "$" + (x / 1_000_000).toFixed(1) + "m";
+  return "$" + nf0.format(x);
+};
+
+const rightShort = (r: "CALL" | "PUT") => (r === "CALL" ? "C" : "P");
+const sideColor = (s: string) =>
+  s === "BUY" ? "bg-green-50 text-green-700 border-green-200"
+  : s === "SELL" ? "bg-red-50 text-red-700 border-red-200"
+  : "bg-gray-50 text-gray-700 border-gray-200";
+
+/* ====== Rolling store + de-dupe for sweeps/blocks (UI-level safety) ====== */
+type FlowAny = Sweep | Block;
+const FLOW_MAX = 1200; // hard cap kept in memory
+
+const flowKey = (m: FlowAny) =>
+  // good uniqueness w/o being too strict; include ts and qty/price to avoid merges of distinct prints
+  [m.ul, m.right, m.strike, m.expiry, m.side, m.ts, m.qty, Math.round((m.price || 0) * 10000)].join("|");
+
+/** Merge incoming rows with previous store, drop dupes, keep newest first, cap length */
+function mergeFlow(prev: FlowAny[], incoming: FlowAny[], cap = FLOW_MAX): FlowAny[] {
+  if (!incoming?.length && !prev?.length) return [];
+  const map = new Map<string, FlowAny>();
+  // keep newest precedence — insert prev first, then incoming overrides
+  for (const r of prev) map.set(flowKey(r), r);
+  for (const r of incoming) map.set(flowKey(r), r);
+  const rows = Array.from(map.values());
+  rows.sort((a, b) => (b.ts - a.ts) || (b.notional ?? notionalOf(b)) - (a.notional ?? notionalOf(a)));
+  return rows.slice(0, cap);
+}
+
+/* ===================== Presentational: Headlines Bar ===================== */
+function HeadlinesBar({ items }: { items: Headline[] }) {
+  const fmtK = (n: number) => {
+    if (n >= 1_000_000) return "$" + (n / 1_000_000).toFixed(1) + "m";
+    return "$" + (n / 1000).toFixed(0) + "k";
+  };
+  const tag = (h: Headline) => {
+    const r = h.right ? (h.right === "CALL" || h.right === "PUT" ? rightShort(h.right) : h.right) : "";
+    const leg = h.strike && r ? ` ${r}${h.strike}` : "";
+    const side = h.side && h.side !== "UNKNOWN" ? ` ${h.side}` : "";
+    return `${h.type} ${h.ul}${leg}${side} · ${fmtK(h.notional)}`;
+  };
+
+  return (
+    <div className="border-b bg-gray-50 px-3 py-2">
+      <div className="overflow-x-auto whitespace-nowrap">
+        {items.length === 0 ? (
+          <span className="text-xs text-gray-500">Headlines: waiting…</span>
+        ) : (
+          items.map((h, i) => (
+            <span
+              key={`${h.ts}:${i}`}
+              className="inline-block text-sm font-semibold mr-3 px-2 py-0.5 rounded bg-white border"
+              title={`${new Date(h.ts).toLocaleTimeString()} · ${h.type}`}
+            >
+              {tag(h)}
+            </span>
+          ))
+        )}
+      </div>
+    </div>
+  );
+}
 
 /* ===================== App ===================== */
 export default function App() {
@@ -158,6 +236,13 @@ export default function App() {
   const [wl, setWl] = useState<Watchlist>({ equities: [], options: [] });
   const [err, setErr] = useState<string | undefined>();
   const [basis, setBasis] = useState<number | null>(null); // ES–SPX basis if server sends it
+
+  // Headlines (top-N, deduped, same WS)
+  const [headlines, setHeadlines] = useState<Headline[]>([]);
+  const HEADLINE_WINDOW_MS = 60_000;
+  const HEADLINE_TOP_N = 12;
+  const headlineKey = (h: Headline) =>
+    [h.type, h.ul, h.right?.[0] ?? "", h.strike ?? "", h.expiry ?? "", h.side ?? ""].join("|");
 
   // --- WS connect ---
   useEffect(() => {
@@ -197,7 +282,6 @@ export default function App() {
                 ? payload.rows!
                 : [];
 
-              // optional basis
               const maybeBasis = Array.isArray(payload) ? null : (payload as any)?.es_spx_basis ?? null;
               setBasis(
                 typeof maybeBasis === "number" && Number.isFinite(maybeBasis) ? maybeBasis : null
@@ -216,30 +300,51 @@ export default function App() {
               break;
             }
             case "basis": {
-            const { es_spx_basis } = msg.data || {};
-            setBasis(es_spx_basis ?? null);
-            break;
+              const { es_spx_basis } = msg.data || {};
+              setBasis(es_spx_basis ?? null);
+              break;
             }
             case "options_ts": {
               setOptions(msg.data as OptionRow[]);
               break;
             }
-
             case "sweeps": {
-              setSweeps((prev) => [...prev.slice(-400), ...(msg.data as Sweep[])]);
+              const incoming = (msg.data as Sweep[]).map((r) => ({ ...r, kind: "SWEEP" as const }));
+              setSweeps((prev) => mergeFlow(prev, incoming, FLOW_MAX) as Sweep[]);
               break;
             }
-
             case "blocks": {
-              setBlocks((prev) => [...prev.slice(-400), ...(msg.data as Block[])]);
+              const incoming = (msg.data as Block[]).map((r) => ({ ...r, kind: "BLOCK" as const }));
+              setBlocks((prev) => mergeFlow(prev, incoming, FLOW_MAX) as Block[]);
               break;
             }
+            case "headlines": {
+              const batch: Headline[] = Array.isArray(msg.data) ? msg.data : [];
+              if (!batch.length) break;
 
+              setHeadlines((prev) => {
+                const now = Date.now();
+                const recent = prev.filter((p) => now - p.ts <= HEADLINE_WINDOW_MS);
+
+                const byKey = new Map<string, Headline>();
+                for (const h of [...recent, ...batch]) {
+                  const k = headlineKey(h);
+                  const cur = byKey.get(k);
+                  if (!cur || h.notional > cur.notional || (h.notional === cur.notional && h.ts > cur.ts)) {
+                    byKey.set(k, h);
+                  }
+                }
+
+                return Array.from(byKey.values())
+                  .sort((a, b) => (b.notional - a.notional) || (b.ts - a.ts))
+                  .slice(0, HEADLINE_TOP_N);
+              });
+              break;
+            }
             case "watchlist": {
               setWl(normalizeWatchlist(msg.data));
               break;
             }
-
             default:
               break;
           }
@@ -276,15 +381,18 @@ export default function App() {
     }));
   }, [options]);
 
-  const filteredSweeps = useMemo(
-    () => sweeps.filter((m) => notionalOf(m) >= minNotional && (m.qty || 0) >= minQty),
-    [sweeps, minNotional, minQty]
-  );
+  // filter + sort (newest first)
+  const filteredSweeps = useMemo(() => {
+    const rows = sweeps.filter((m) => notionalOf(m) >= minNotional && (m.qty || 0) >= minQty);
+    rows.sort((a, b) => b.ts - a.ts);
+    return rows;
+  }, [sweeps, minNotional, minQty]);
 
-  const filteredBlocks = useMemo(
-    () => blocks.filter((m) => notionalOf(m) >= minNotional && (m.qty || 0) >= minQty),
-    [blocks, minNotional, minQty]
-  );
+  const filteredBlocks = useMemo(() => {
+    const rows = blocks.filter((m) => notionalOf(m) >= minNotional && (m.qty || 0) >= minQty);
+    rows.sort((a, b) => b.ts - a.ts);
+    return rows;
+  }, [blocks, minNotional, minQty]);
 
   // --- REST actions (watchlist) ---
   async function addEquity(sym: string) {
@@ -345,6 +453,9 @@ export default function App() {
         </div>
       </div>
 
+      {/* Headlines bar (single WS, deduped) */}
+      <HeadlinesBar items={headlines} />
+
       {/* Layout */}
       <div className="p-4 grid gap-4" style={{ gridTemplateColumns: "1.2fr 1fr" }}>
         {/* Left column */}
@@ -357,10 +468,10 @@ export default function App() {
                 <thead>
                   <tr className="text-left border-b">
                     <th className="py-1 pr-3">Symbol</th>
-                    <th className="py-1 pr-3">Last</th>
-                    <th className="py-1 pr-3">Bid</th>
-                    <th className="py-1 pr-3">Ask</th>
-                    <th className="py-1 pr-3">IV</th>
+                    <th className="py-1 pr-3 text-right">Last</th>
+                    <th className="py-1 pr-3 text-right">Bid</th>
+                    <th className="py-1 pr-3 text-right">Ask</th>
+                    <th className="py-1 pr-3 text-right">IV</th>
                     <th className="py-1 pr-3">Age</th>
                   </tr>
                 </thead>
@@ -368,10 +479,10 @@ export default function App() {
                   {equityRows.map((r) => (
                     <tr key={r.symbol} className="border-b last:border-0">
                       <td className="py-1 pr-3 font-mono">{r.symbol}</td>
-                      <td className="py-1 pr-3">{marketFmt.price(r.symbol, r.last)}</td>
-                      <td className="py-1 pr-3">{marketFmt.nbbo(r.bid)}</td>
-                      <td className="py-1 pr-3">{marketFmt.nbbo(r.ask)}</td>
-                      <td className="py-1 pr-3">{marketFmt.iv(r.iv)}</td>
+                      <td className="py-1 pr-3 text-right">{marketFmt.price(r.symbol, r.last)}</td>
+                      <td className="py-1 pr-3 text-right">{marketFmt.nbbo(r.bid)}</td>
+                      <td className="py-1 pr-3 text-right">{marketFmt.nbbo(r.ask)}</td>
+                      <td className="py-1 pr-3 text-right">{marketFmt.iv(r.iv)}</td>
                       <td className="py-1 pr-3">{tsAgo(r.ts)}</td>
                     </tr>
                   ))}
@@ -396,9 +507,9 @@ export default function App() {
                           <tr className="text-left border-b">
                             <th className="py-1 pr-3">Strike</th>
                             <th className="py-1 pr-3">Right</th>
-                            <th className="py-1 pr-3">Last</th>
-                            <th className="py-1 pr-3">Bid</th>
-                            <th className="py-1 pr-3">Ask</th>
+                            <th className="py-1 pr-3 text-right">Last</th>
+                            <th className="py-1 pr-3 text-right">Bid</th>
+                            <th className="py-1 pr-3 text-right">Ask</th>
                             <th className="py-1 pr-3">Age</th>
                           </tr>
                         </thead>
@@ -407,9 +518,9 @@ export default function App() {
                             <tr key={`${key}:${i}`} className="border-b last:border-0">
                               <td className="py-1 pr-3">{r.strike}</td>
                               <td className="py-1 pr-3">{r.right}</td>
-                              <td className="py-1 pr-3">{fmt(r.last, 2)}</td>
-                              <td className="py-1 pr-3">{fmtOrDashIfZero(r.bid, 2)}</td>
-                              <td className="py-1 pr-3">{fmtOrDashIfZero(r.ask, 2)}</td>
+                              <td className="py-1 pr-3 text-right">{fmt(r.last, 2)}</td>
+                              <td className="py-1 pr-3 text-right">{fmtOrDashIfZero(r.bid, 2)}</td>
+                              <td className="py-1 pr-3 text-right">{fmtOrDashIfZero(r.ask, 2)}</td>
                               <td className="py-1 pr-3">{tsAgo(r.ts)}</td>
                             </tr>
                           ))}
@@ -516,30 +627,32 @@ export default function App() {
             </div>
             <div className="overflow-auto max-h-[360px]">
               <table className="min-w-full text-sm">
-                <thead>
+                <thead className="sticky top-0 bg-white">
                   <tr className="text-left border-b">
                     <th className="py-1 pr-3">UL</th>
                     <th className="py-1 pr-3">Right</th>
                     <th className="py-1 pr-3">Strike</th>
                     <th className="py-1 pr-3">Expiry</th>
                     <th className="py-1 pr-3">Side</th>
-                    <th className="py-1 pr-3">Qty</th>
-                    <th className="py-1 pr-3">Price</th>
-                    <th className="py-1 pr-3">Notional</th>
+                    <th className="py-1 pr-3 text-right">Qty</th>
+                    <th className="py-1 pr-3 text-right">Price</th>
+                    <th className="py-1 pr-3 text-right">Notional</th>
                     <th className="py-1 pr-3">Age</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredSweeps.slice(-200).reverse().map((r, i) => (
+                  {filteredSweeps.slice(0, 200).map((r, i) => (
                     <tr key={i} className="border-b last:border-0">
                       <td className="py-1 pr-3 font-mono">{r.ul}</td>
-                      <td className="py-1 pr-3">{r.right}</td>
+                      <td className="py-1 pr-3">{rightShort(r.right)}</td>
                       <td className="py-1 pr-3">{r.strike}</td>
                       <td className="py-1 pr-3">{r.expiry}</td>
-                      <td className="py-1 pr-3">{r.side}</td>
-                      <td className="py-1 pr-3">{r.qty}</td>
-                      <td className="py-1 pr-3">{fmt(r.price, 2)}</td>
-                      <td className="py-1 pr-3">{fmt(notionalOf(r), 0)}</td>
+                      <td className="py-1 pr-3">
+                        <span className={`px-2 py-0.5 rounded border text-xs ${sideColor(r.side)}`}>{r.side}</span>
+                      </td>
+                      <td className="py-1 pr-3 text-right">{fmtQty(r.qty)}</td>
+                      <td className="py-1 pr-3 text-right">{nf2.format(r.price)}</td>
+                      <td className="py-1 pr-3 text-right">{fmtMoneyCompact(notionalOf(r))}</td>
                       <td className="py-1 pr-3">{tsAgo(r.ts)}</td>
                     </tr>
                   ))}
@@ -556,30 +669,32 @@ export default function App() {
             </div>
             <div className="overflow-auto max-h-[360px]">
               <table className="min-w-full text-sm">
-                <thead>
+                <thead className="sticky top-0 bg-white">
                   <tr className="text-left border-b">
                     <th className="py-1 pr-3">UL</th>
                     <th className="py-1 pr-3">Right</th>
                     <th className="py-1 pr-3">Strike</th>
                     <th className="py-1 pr-3">Expiry</th>
                     <th className="py-1 pr-3">Side</th>
-                    <th className="py-1 pr-3">Qty</th>
-                    <th className="py-1 pr-3">Price</th>
-                    <th className="py-1 pr-3">Notional</th>
+                    <th className="py-1 pr-3 text-right">Qty</th>
+                    <th className="py-1 pr-3 text-right">Price</th>
+                    <th className="py-1 pr-3 text-right">Notional</th>
                     <th className="py-1 pr-3">Age</th>
                   </tr>
                 </thead>
                 <tbody>
-                  {filteredBlocks.slice(-200).reverse().map((r, i) => (
+                  {filteredBlocks.slice(0, 200).map((r, i) => (
                     <tr key={i} className="border-b last:border-0">
                       <td className="py-1 pr-3 font-mono">{r.ul}</td>
-                      <td className="py-1 pr-3">{r.right}</td>
+                      <td className="py-1 pr-3">{rightShort(r.right)}</td>
                       <td className="py-1 pr-3">{r.strike}</td>
                       <td className="py-1 pr-3">{r.expiry}</td>
-                      <td className="py-1 pr-3">{r.side}</td>
-                      <td className="py-1 pr-3">{r.qty}</td>
-                      <td className="py-1 pr-3">{fmt(r.price, 2)}</td>
-                      <td className="py-1 pr-3">{fmt(notionalOf(r), 0)}</td>
+                      <td className="py-1 pr-3">
+                        <span className={`px-2 py-0.5 rounded border text-xs ${sideColor(r.side)}`}>{r.side}</span>
+                      </td>
+                      <td className="py-1 pr-3 text-right">{fmtQty(r.qty)}</td>
+                      <td className="py-1 pr-3 text-right">{nf2.format(r.price)}</td>
+                      <td className="py-1 pr-3 text-right">{fmtMoneyCompact(notionalOf(r))}</td>
                       <td className="py-1 pr-3">{tsAgo(r.ts)}</td>
                     </tr>
                   ))}
